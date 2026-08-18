@@ -1,0 +1,159 @@
+diff --git a/src/platform/windows/root.zig b/src/platform/windows/root.zig
+index 7debdf9..6b5ea0d 100644
+--- a/src/platform/windows/root.zig
++++ b/src/platform/windows/root.zig
+@@ -139,6 +139,8 @@ extern fn native_sdk_windows_cancel_timer(host: *WindowsHost, timer_id: u64) voi
+ extern fn native_sdk_windows_focus_window(host: *WindowsHost, window_id: u64) c_int;
+ extern fn native_sdk_windows_close_window(host: *WindowsHost, window_id: u64) c_int;
+ extern fn native_sdk_windows_minimize_window(host: *WindowsHost, window_id: u64) c_int;
++extern fn native_sdk_windows_move_window(host: *WindowsHost, window_id: u64, dx: f64, dy: f64, clamp: c_int, out_x: *f64, out_y: *f64, out_hit_x: *c_int, out_hit_y: *c_int, out_primary_down: *c_int, out_vx: *f64, out_vy: *f64, out_released: *c_int, out_cursor_x: *f64, out_cursor_y: *f64) c_int;
++extern fn native_sdk_windows_resize_window(host: *WindowsHost, window_id: u64, width: f64, height: f64, anchor_bottom_center: c_int) c_int;
+ extern fn native_sdk_windows_create_view(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, kind: c_int, parent: [*]const u8, parent_len: usize, x: f64, y: f64, width: f64, height: f64, layer: c_int, visible: c_int, enabled: c_int, role: [*]const u8, role_len: usize, accessibility_label: [*]const u8, accessibility_label_len: usize, text: [*]const u8, text_len: usize, command: [*]const u8, command_len: usize) c_int;
+ extern fn native_sdk_windows_update_view(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, has_frame: c_int, x: f64, y: f64, width: f64, height: f64, has_layer: c_int, layer: c_int, has_visible: c_int, visible: c_int, has_enabled: c_int, enabled: c_int, has_role: c_int, role: [*]const u8, role_len: usize, has_accessibility_label: c_int, accessibility_label: [*]const u8, accessibility_label_len: usize, has_text: c_int, text: [*]const u8, text_len: usize, has_command: c_int, command: [*]const u8, command_len: usize) c_int;
+ extern fn native_sdk_windows_set_view_frame(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, x: f64, y: f64, width: f64, height: f64) c_int;
+@@ -282,6 +284,8 @@ pub const WindowsPlatform = struct {
+                 .focus_window_fn = focusWindow,
+                 .close_window_fn = closeWindow,
+                 .minimize_window_fn = minimizeWindow,
++                .move_window_fn = moveWindow,
++                .resize_window_fn = resizeWindow,
+                 .start_window_drag_fn = startWindowDrag,
+                 .set_window_drag_regions_fn = setWindowDragRegions,
+                 .window_chrome_fn = windowChrome,
+@@ -754,6 +758,33 @@ fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerr
+     if (native_sdk_windows_minimize_window(self.host, window_id) == 0) return error.WindowNotFound;
+ }
+ 
++/// Move by a screen-space delta and report the applied origin, clamp
++/// stops, primary-button state, and the global cursor — the drag
++/// physics seam macOS implements the same way. The host reports LOGICAL
++/// points, matching the runtime's window-geometry convention.
++fn moveWindow(context: ?*anyopaque, window_id: platform_mod.WindowId, dx: f64, dy: f64, clamp: bool) anyerror!platform_mod.MoveWindowResult {
++    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
++    var out_x: f64 = 0;
++    var out_y: f64 = 0;
++    var out_hit_x: c_int = 0;
++    var out_hit_y: c_int = 0;
++    var out_primary: c_int = 0;
++    var out_vx: f64 = 0;
++    var out_vy: f64 = 0;
++    var out_released: c_int = 0;
++    var out_cursor_x: f64 = 0;
++    var out_cursor_y: f64 = 0;
++    if (native_sdk_windows_move_window(self.host, window_id, dx, dy, if (clamp) 1 else 0, &out_x, &out_y, &out_hit_x, &out_hit_y, &out_primary, &out_vx, &out_vy, &out_released, &out_cursor_x, &out_cursor_y) == 0) return error.WindowNotFound;
++    return .{ .x = out_x, .y = out_y, .hit_x = out_hit_x != 0, .hit_y = out_hit_y != 0, .primary_down = out_primary != 0, .vx = out_vx, .vy = out_vy, .released = out_released != 0, .cursor_x = out_cursor_x, .cursor_y = out_cursor_y };
++}
++
++/// Resize to an exact logical size, anchored `.top_left` or
++/// `.bottom_center` (the companion-window fit verb).
++fn resizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId, width: f64, height: f64, anchor: platform_mod.WindowResizeAnchor) anyerror!void {
++    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
++    if (native_sdk_windows_resize_window(self.host, window_id, width, height, if (anchor == .bottom_center) 1 else 0) == 0) return error.WindowNotFound;
++}
++
+ fn startWindowDrag(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
+     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+     if (native_sdk_windows_start_window_drag(self.host, window_id) == 0) return error.WindowNotFound;
+diff --git a/src/platform/windows/webview2_host.cpp b/src/platform/windows/webview2_host.cpp
+index 4dd7ecd..e63e549 100644
+--- a/src/platform/windows/webview2_host.cpp
++++ b/src/platform/windows/webview2_host.cpp
+@@ -6101,6 +6101,98 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
+     return 1;
+ }
+ 
++/* Move by a screen-space delta (dx right, dy DOWN, the pointer
++ * convention), optionally clamped to the owning monitor's work area,
++ * and report the applied origin, clamp stops, the live primary-button
++ * state, and the global cursor — the same contract
++ * native_sdk_appkit_move_window implements on macOS, which the runtime
++ * surfaces as MoveWindowResult for app-driven drag physics. Origins and
++ * the cursor are LOGICAL points: the physical GetWindowRect/GetCursorPos
++ * values divide by the window's own DPI scale, and a DPI-unaware
++ * process (scale 1) passes them through unchanged. Physical work-area
++ * bounds clamp the physical target and the clamped origin converts
++ * back, so mixed-DPI boundaries clamp where the window actually is. */
++int native_sdk_windows_move_window(Host *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y) {
++    if (out_hit_x) *out_hit_x = 0;
++    if (out_hit_y) *out_hit_y = 0;
++    if (out_vx) *out_vx = 0;
++    if (out_vy) *out_vy = 0;
++    if (out_released) *out_released = 0;
++    if (!host) return 0;
++    auto found = host->windows.find(window_id);
++    if (found == host->windows.end() || !found->second.hwnd) return 0;
++    HWND hwnd = found->second.hwnd;
++    RECT rect = {};
++    if (!GetWindowRect(hwnd, &rect)) return 0;
++    const double scale = gpuSurfaceScale(hwnd);
++    if (scale <= 0) return 0;
++    double phys_x = (double)rect.left + dx * scale;
++    double phys_y = (double)rect.top + dy * scale;
++    if (clamp) {
++        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
++        MONITORINFO info = {};
++        info.cbSize = sizeof(info);
++        if (monitor && GetMonitorInfoW(monitor, &info)) {
++            const RECT &work = info.rcWork;
++            if (phys_x < (double)work.left) { phys_x = work.left; if (out_hit_x) *out_hit_x = 1; }
++            if (phys_x > (double)work.right - (rect.right - rect.left)) { phys_x = (double)work.right - (rect.right - rect.left); if (out_hit_x) *out_hit_x = 1; }
++            if (phys_y < (double)work.top) { phys_y = work.top; if (out_hit_y) *out_hit_y = 1; }
++            if (phys_y > (double)work.bottom - (rect.bottom - rect.top)) { phys_y = (double)work.bottom - (rect.bottom - rect.top); if (out_hit_y) *out_hit_y = 1; }
++        }
++    }
++    if (dx != 0 || dy != 0) {
++        SetWindowPos(hwnd, nullptr, (int)llround(phys_x), (int)llround(phys_y), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
++    }
++    if (out_x) *out_x = phys_x / scale;
++    if (out_y) *out_y = phys_y / scale;
++    /* Live physical button state, NOT GetKeyState: that reads the
++     * calling thread's message-queue snapshot, and the runtime's loop
++     * thread is not the message pump, so mid-drag polls saw stale
++     * "released" values that aborted app-owned drags (spurious
++     * momentum throws). GetAsyncKeyState is thread-independent. */
++    if (out_primary_down) *out_primary_down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0;
++    if (out_cursor_x || out_cursor_y) {
++        POINT cursor = {};
++        GetCursorPos(&cursor);
++        if (out_cursor_x) *out_cursor_x = (double)cursor.x / scale;
++        if (out_cursor_y) *out_cursor_y = (double)cursor.y / scale;
++    }
++    return 1;
++}
++
++/* Resize to an exact logical size keeping an anchor fixed
++ * (`.bottom_center` grows in place; `.top_left` is the default), the
++ * companion-window fit verb. Physical SetWindowPos sizes scale up the
++ * logical request; the kept anchor edge converts the same way move
++ * does, so a bottom_center resize on a scaled monitor keeps the
++ * sprite's feet planted. */
++int native_sdk_windows_resize_window(Host *host, uint64_t window_id, double width, double height, int anchor_bottom_center) {
++    if (!host || width <= 0 || height <= 0) return 0;
++    auto found = host->windows.find(window_id);
++    if (found == host->windows.end() || !found->second.hwnd) return 0;
++    HWND hwnd = found->second.hwnd;
++    RECT rect = {};
++    if (!GetWindowRect(hwnd, &rect)) return 0;
++    const double scale = gpuSurfaceScale(hwnd);
++    if (scale <= 0) return 0;
++    const double phys_w = width * scale;
++    const double phys_h = height * scale;
++    /* The client area is what the runtime sizes; keep the existing
++     * chrome margins so the logical request maps to client points. */
++    RECT client = {};
++    GetClientRect(hwnd, &client);
++    const double chrome_x = (rect.right - rect.left) - (client.right - client.left);
++    const double chrome_y = (rect.bottom - rect.top) - (client.bottom - client.top);
++    double phys_x = (double)rect.left;
++    double phys_y = (double)rect.top;
++    if (anchor_bottom_center) {
++        phys_x = (double)rect.left + ((rect.right - rect.left) - phys_w - chrome_x) / 2.0;
++        phys_y = (double)rect.bottom - phys_h - chrome_y;
++    }
++    SetWindowPos(hwnd, nullptr, (int)llround(phys_x), (int)llround(phys_y), (int)llround(phys_w + chrome_x), (int)llround(phys_h + chrome_y), SWP_NOZORDER | SWP_NOACTIVATE);
++    return 1;
++}
++
+ int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
+     if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
+     auto window = host->windows.find(window_id);
