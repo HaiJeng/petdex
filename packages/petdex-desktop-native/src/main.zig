@@ -5598,3 +5598,20 @@ test "an unchanged bubble keeps its deadline when another one updates" {
     try std.testing.expectEqual(@as(i64, 4000), model.bubble_expires_at_ms[0]);
     try std.testing.expectEqual(@as(i64, 15_000), model.bubble_expires_at_ms[1]);
 }
+
+test "CJK fallback only resolves paths the platform actually ships" {
+    // No WINDIR in the test environment: Windows probing must return
+    // null rather than fabricate a path, so boot registers no font and
+    // the bundled faces keep rendering (the pre-fallback behavior).
+    const saved = env_windir;
+    defer env_windir = saved;
+    env_windir = null;
+    var buf: [512]u8 = undefined;
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqual(@as(?[]const u8, null), platformCjkFontPath(&buf));
+    }
+    // With a WINDIR that has no fonts directory, the probe still finds
+    // nothing and reports null honestly.
+    env_windir = "/nonexistent";
+    try std.testing.expectEqual(@as(?[]const u8, null), platformCjkFontPath(&buf));
+}
