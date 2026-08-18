@@ -902,6 +902,7 @@ var sheet: Sheet = .{};
 /// global getenv; env rides std.process.Init).
 var env_home: ?[]const u8 = null;
 var env_wanted_pet: ?[]const u8 = null;
+var env_windir: ?[]const u8 = null;
 
 fn readFileAbsolute(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
@@ -969,6 +970,37 @@ var initial_font_path: [512]u8 = @splat(0);
 var initial_font_path_len: usize = 0;
 var initial_font_load_failed: bool = false;
 pub var custom_font_active: bool = false;
+
+/// The bundled faces carry no CJK outlines, so a bubble whose hooks speak
+/// Chinese/Japanese/Korean renders as empty cards (the "black box" the
+/// deep theme showed). When the user has not picked a font, register a
+/// platform CJK face as the app font so those strings draw. The face must
+/// be a plain TrueType `glyf` build: the parser refuses .ttc collections
+/// and CFF/OTTO faces outright.
+fn platformCjkFontPath(buf: []u8) ?[]const u8 {
+    switch (builtin.os.tag) {
+        .windows => {
+            const base = env_windir orelse return null;
+            for ([_][]const u8{ "\\Fonts\\simhei.ttf", "\\Fonts\\msyh.ttc" }) |suffix| {
+                const path = std.fmt.bufPrint(buf, "{s}{s}", .{ base, suffix }) catch continue;
+                if (plat.fileExists(path)) return path;
+            }
+            return null;
+        },
+        .macos => {
+            for ([_][]const u8{ "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc" }) |path| {
+                if (plat.fileExists(path)) return path;
+            }
+            return null;
+        },
+        else => {
+            for ([_][]const u8{"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"}) |path| {
+                if (plat.fileExists(path)) return path;
+            }
+            return null;
+        },
+    }
+}
 
 /// Tiny file helpers usable from the runtime thread. They carry their
 /// own Io (see plat.zig), so the main thread's never leaks off-thread;
@@ -4146,6 +4178,7 @@ pub fn main(init: std.process.Init) !void {
     // %USERPROFILE%\.petdex\pets. HOME still wins where it exists, so a
     // POSIX user pointing it elsewhere keeps that.
     env_home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE");
+    env_windir = init.environ_map.get("WINDIR");
     // Claude Code honors CLAUDE_CONFIG_DIR for fully isolated installs;
     // wiring hooks into ~/.claude for those users writes a settings.json
     // their Claude Code never reads, and detection shows them as
@@ -4196,15 +4229,21 @@ pub fn main(init: std.process.Init) !void {
     defer if (custom_font_bytes) |bytes| boot_allocator.free(bytes);
     var font_registrations: [1]PetdexApp.FontRegistration = undefined;
     var app_fonts: []const PetdexApp.FontRegistration = &.{};
-    if (initial_font_path_len > 0) {
-        const path = initial_font_path[0..initial_font_path_len];
-        if (plat.readFileAlloc(boot_allocator, path, max_custom_font_bytes)) |bytes| {
+    var cjk_path_buf: [512]u8 = undefined;
+    const font_path: []const u8 = if (initial_font_path_len > 0)
+        initial_font_path[0..initial_font_path_len]
+    else
+        // No user font: fall back to a platform CJK face so non-Latin
+        // hook text draws instead of clearing to empty cards.
+        platformCjkFontPath(&cjk_path_buf) orelse "";
+    if (font_path.len > 0) {
+        if (plat.readFileAlloc(boot_allocator, font_path, max_custom_font_bytes)) |bytes| {
             if (canvas.font_ttf.parseFailureReason(bytes) == null) {
                 custom_font_bytes = bytes;
                 custom_font_active = true;
                 font_registrations[0] = .{
                     .id = custom_font_id,
-                    .name = path,
+                    .name = font_path,
                     .ttf = bytes,
                 };
                 app_fonts = font_registrations[0..];
@@ -4212,7 +4251,7 @@ pub fn main(init: std.process.Init) !void {
                 boot_allocator.free(bytes);
                 initial_font_load_failed = true;
             }
-        } else {
+        } else if (initial_font_path_len > 0) {
             initial_font_load_failed = true;
         }
     }
