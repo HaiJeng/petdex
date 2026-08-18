@@ -96,7 +96,13 @@ var more_label_buf: [48]u8 = undefined;
 
 var install_label_buf: [128]u8 = undefined;
 
-fn petMatchesFilter(name: []const u8, filter: []const u8) bool {
+/// Rows the collapsed pet list draws; main.zig's thumbnail builder
+/// decodes exactly these, no more.
+pub const collapsed_pet_rows: usize = 6;
+
+/// Case-insensitive substring match, ASCII-folded: pet slugs are ASCII,
+/// and this keeps the filter a scan instead of an allocator.
+pub fn petMatchesFilter(name: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;
     if (name.len < filter.len) return false;
     var i: usize = 0;
@@ -336,7 +342,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
     var rows: [max_catalog]AppUi.Node = undefined;
     var shown: usize = 0;
     var matches: usize = 0;
-    const max_visible: usize = if (model.pets_expanded) max_catalog else 6;
+    const max_visible: usize = if (model.pets_expanded) max_catalog else collapsed_pet_rows;
     const filter = model.pet_filter[0..model.pet_filter_len];
     for (catalog[0..@min(catalog_mod.catalog_len, max_catalog)], 0..) |*entry, i| {
         if (!petMatchesFilter(entry.slice(), filter)) continue;
@@ -401,7 +407,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         ui.column(.{ .gap = 6 }, @as([]const AppUi.Node, rows[0..shown])),
         if (matches > shown)
             ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, moreLabel(matches))
-        else if (model.pets_expanded and matches > 6)
+        else if (model.pets_expanded and matches > collapsed_pet_rows)
             ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, "Show less")
         else if (matches == 0)
             ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "No pets match your search")

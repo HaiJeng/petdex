@@ -55,10 +55,108 @@ index 7debdf9..6b5ea0d 100644
      const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
      if (native_sdk_windows_start_window_drag(self.host, window_id) == 0) return error.WindowNotFound;
 diff --git a/src/platform/windows/webview2_host.cpp b/src/platform/windows/webview2_host.cpp
-index 4dd7ecd..e63e549 100644
+index 4dd7ecd..e1d21b6 100644
 --- a/src/platform/windows/webview2_host.cpp
 +++ b/src/platform/windows/webview2_host.cpp
-@@ -6101,6 +6101,98 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
+@@ -412,6 +412,18 @@ struct NativeView {
+      * idle law the macOS host enforces). */
+     bool gpu_emission_scheduled = false;
+     bool gpu_presented = false;
++    /* Pending wheel deltas not yet dispatched to the engine. A
++     * high-resolution mouse delivers WM_MOUSEWHEEL far faster than the
++     * frame grid, and each immediate dispatch costs a full engine
++     * update+layout+raster pass — measured a whole core saturated while
++     * scrolling a 420x680 settings page. Accumulate instead and flush
++     * ONE combined scroll event per pump iteration (the flush rides the
++     * same one-shot scheduler law as frame emissions). */
++    double gpu_wheel_delta_x = 0;
++    double gpu_wheel_delta_y = 0;
++    bool gpu_wheel_pending = false;
++    double gpu_wheel_last_x = 0;
++    double gpu_wheel_last_y = 0;
+     /* One-shot: the next scheduled emission must fire at grid
+      * promptness even while minimized. Two producers set it — an input
+      * dispatched to the surface (its responding frame is the
+@@ -2130,6 +2142,8 @@ constexpr uint64_t kGpuOccludedHeartbeatNs = 1000000000ull;
+ constexpr UINT_PTR kGpuFrameTimerId = 1;
+ /* The one-shot scheduled-emission timer (the single frame-event gate). */
+ constexpr UINT_PTR kGpuEmitTimerId = 2;
++/* The one-shot wheel-coalescing flush (see the WM_MOUSEWHEEL handler). */
++constexpr UINT_PTR kGpuWheelTimerId = 3;
+ 
+ static uint64_t gpuTimestampNs() {
+     static LARGE_INTEGER frequency = {};
+@@ -2870,6 +2884,23 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
+                 gpuSurfaceEmitFrame(host, *view, hwnd);
+                 return 0;
+             }
++            if (wparam == kGpuWheelTimerId) {
++                /* One flush per pump iteration: KillTimer before the emit
++                 * makes the flag reset+dispatch atomic against re-entry,
++                 * the same pattern the emission scheduler uses. Wheel
++                 * events arriving during the engine dispatch queue onto
++                 * the next flush. */
++                KillTimer(hwnd, kGpuWheelTimerId);
++                if (view->gpu_wheel_pending) {
++                    view->gpu_wheel_pending = false;
++                    emitGpuSurfaceInput(host, *view, kGpuInputScroll,
++                                        view->gpu_wheel_last_x, view->gpu_wheel_last_y, 0,
++                                        view->gpu_wheel_delta_x, view->gpu_wheel_delta_y, "", "", gpuModifierFlags());
++                    view->gpu_wheel_delta_x = 0;
++                    view->gpu_wheel_delta_y = 0;
++                }
++                return 0;
++            }
+             break;
+         case WM_PAINT: {
+             PAINTSTRUCT paint = {};
+@@ -2971,11 +3002,22 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
+             /* One wheel notch scrolls 40 logical units, the cadence the GTK
+              * host uses; forward wheel rotation (positive Win32 delta) means
+              * scroll up, which the shared input semantics express as a
+-             * negative delta_y. */
++             * negative delta_y. Accumulated, not dispatched: a flush below
++             * folds every pending notch into one engine pass (see the
++             * NativeView wheel fields). */
+             const double delta = (double)(short)HIWORD(wparam) / (double)WHEEL_DELTA * 40.0;
+-            const double delta_x = message == WM_MOUSEHWHEEL ? delta : 0;
+-            const double delta_y = message == WM_MOUSEWHEEL ? -delta : 0;
+-            emitGpuSurfaceInput(host, *view, kGpuInputScroll, x, y, 0, delta_x, delta_y, "", "", gpuModifierFlags());
++            view->gpu_wheel_delta_x += message == WM_MOUSEHWHEEL ? delta : 0;
++            view->gpu_wheel_delta_y += message == WM_MOUSEWHEEL ? -delta : 0;
++            view->gpu_wheel_last_x = x;
++            view->gpu_wheel_last_y = y;
++            if (!view->gpu_wheel_pending) {
++                view->gpu_wheel_pending = true;
++                /* ~half a frame: coalesces a fast wheel into at most one
++                 * engine pass per interval while the latency stays well
++                 * inside the 16 ms frame grid (a 1 ms flush let a
++                 * high-rate wheel run the engine flat out). */
++                SetTimer(hwnd, kGpuWheelTimerId, 8, nullptr);
++            }
+             return 0;
+         }
+         case WM_KEYDOWN:
+@@ -5185,6 +5227,18 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
+             if (host && handleAppTimerMessage(host, wparam)) return 0;
+             if (host && handleAudioTimerMessage(host, wparam)) return 0;
+             if (host && wparam == kFrameTimerId) {
++                /* SetWindowPos(HWND_TOPMOST) issued while the first-show
++                 * activation dance is still settling (queues attached to
++                 * the previous foreground window) succeeds but never
++                 * lands the WS_EX_TOPMOST band. The frame timer is the
++                 * first settled point after activation completes, so
++                 * until the bit sticks it is re-asserted here — once it
++                 * holds, the read is cheap and nothing further runs. */
++                for (auto &entry : host->windows) {
++                    if (!entry.second.floating || !entry.second.hwnd) continue;
++                    if (GetWindowLongPtrW(entry.second.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) continue;
++                    SetWindowPos(entry.second.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++                }
+                 for (auto &entry : host->windows) emit(host, entry.second, kFrame);
+             }
+             return 0;
+@@ -6101,6 +6155,98 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
      return 1;
  }
  
@@ -157,3 +255,60 @@ index 4dd7ecd..e63e549 100644
  int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
      if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
      auto window = host->windows.find(window_id);
+diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
+index bedf1c3..5b53c60 100644
+--- a/src/runtime/ui_app.zig
++++ b/src/runtime/ui_app.zig
+@@ -687,6 +687,28 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             /// secondary window is a `canvas.CompiledMarkupView` whose
+             /// `build` this fn calls for the matching label.
+             window_view: ?*const fn (ui: *Ui, model: *const ModelT, window_label: []const u8) Ui.Node = null,
++            /// Per-window design-token refinement, keyed by the window
++            /// label (empty label = the main window). Applied AFTER
++            /// `tokens_fn`/`tokens` and BEFORE the pixel-snap scale, so a
++            /// window can carry a different `typography.font_id` than the
++            /// app-wide set — the whole-app token forces every window
++            /// through one font, and an app that registers a fallback
++            /// face only some windows' text needs (a CJK face beside a
++            /// fast bundled Latin face) could not split them before this
++            /// seam. Null keeps the app-wide tokens untouched.
++            window_tokens_fn: ?*const fn (window_label: []const u8, tokens: canvas.DesignTokens, model: *const ModelT) canvas.DesignTokens = null,
++            /// Msgs that cannot change any SECONDARY window's view, so
++            /// their dispatch skips the per-window rebuild. The main
++            /// canvas always rebuilds — only the declared windows are
++            /// skipped. This exists for per-frame Msgs: an app that polls
++            /// input from `on_frame` dispatches one Msg per presented
++            /// frame, and rebuilding every open window on each of them
++            /// re-lays-out unrelated pages (a settings window's whole
++            /// tree) at frame rate. Returning true for such a Msg is a
++            /// claim the app must honor: if the Msg DOES change a
++            /// window's view, that window keeps painting stale content
++            /// until the next unskipped dispatch.
++            window_rebuild_skip_fn: ?*const fn (msg: MsgT) bool = null,
+         };
+ 
+         /// Last-navigated webview pane state, tracked per shell label so
+@@ -1166,7 +1188,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             // used to cost a full view build on the launch path.
+             if (!self.installed) return;
+             try self.rebuild(runtime, self.canvas_window_id);
+-            try self.rebuildWindowSlots(runtime);
++            // Per-frame Msgs skip the secondary-window rebuild (see
++            // `window_rebuild_skip_fn`): rebuilding every declared
++            // window at frame rate re-lays-out pages the Msg cannot
++            // affect.
++            const skip_windows = if (self.options.window_rebuild_skip_fn) |skip| skip(msg) else false;
++            if (!skip_windows) try self.rebuildWindowSlots(runtime);
+             // A Msg dispatched FROM a secondary window still rebuilt the
+             // main canvas above (one model, every window's view derives
+             // from it); `window_id` names the dispatch origin for apps
+@@ -1277,6 +1304,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+         /// the appearance.
+         fn slotEffectiveTokens(self: *const Self, slot: *const WindowSlot) canvas.DesignTokens {
+             var tokens = self.effectiveTokens();
++            if (self.options.window_tokens_fn) |window_tokens_fn| {
++                tokens = window_tokens_fn(slot.label(), tokens, &self.model);
++            }
+             tokens.pixel_snap.scale = slot.pixel_snap_scale;
+             return tokens;
+         }

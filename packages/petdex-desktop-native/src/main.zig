@@ -130,6 +130,7 @@ pub const Msg = union(enum) {
     check_updates,
     toggle_update_checks,
     update_response: native_sdk.EffectResponse,
+    settings_save_tick: native_sdk.EffectTimer,
     homebrew_done: native_sdk.EffectExit,
     homebrew_timeout: native_sdk.EffectTimer,
     download_update,
@@ -137,7 +138,7 @@ pub const Msg = union(enum) {
     brew_command_copied: native_sdk.EffectClipboardResult,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "settings_save_tick" };
 };
 
 pub const Model = struct {
@@ -213,6 +214,8 @@ pub const Model = struct {
     press_ms: i64 = 0,
     pat_flip: bool = false,
     settings_open: bool = false,
+    /// Set by debounced saves; flushed by `settings_save_tick`.
+    settings_dirty: bool = false,
     /// Sprite scale, persisted. Codex parity: the settings slider maps
     /// 0.4..1.2 over this.
     scale: f32 = 0.7,
@@ -283,6 +286,13 @@ pub const Model = struct {
     pos_restored: bool = false,
     pet_x: f64 = 0,
     pet_y: f64 = 0,
+    /// The last want-origin the bubble sync asked for that the display
+    /// clamped away, plus the pet position it was computed from. While
+    /// the pet has not moved, the same want would be refused again, so
+    /// the sync stands down instead of fighting the clamp every frame
+    /// (a 48px oscillation when the centered bubble crosses a screen
+    /// edge: recompute-want, move, clamp, recompute-want, ...).
+    bubble_clamped_want: ?struct { x: f64, y: f64, pet_x: f64, pet_y: f64 } = null,
     agents: [agent_hooks.agent_count]agent_hooks.AgentInfo = .{
         .{ .kind = .claude_code },
         .{ .kind = .codex },
@@ -324,6 +334,36 @@ pub const Model = struct {
 /// Petdex web tokens (globals.css) translated from OKLCH: brand purple
 /// #5266ea family, cool-tinted near-white light surfaces, stone-900
 /// dark cards. High contrast keeps the stock loud register untouched.
+/// Whether any text the model currently shows needs the CJK fallback:
+/// a showable bubble whose title or body carries a non-ASCII byte. The
+/// fallback face is scoped to the bubble window (see petdexWindowTokens);
+/// this answers whether THAT window's text needs it.
+fn modelNeedsCjkFont(model: *const Model) bool {
+    if (!bubbleActive(model)) return false;
+    for (model.bubbles[0..model.bubbles_len]) |*bubble| {
+        const title = bubble.title[0..bubble.title_len];
+        const body = bubble.text[0..bubble.text_len];
+        for (title) |b| if (b >= 0x80) return true;
+        for (body) |b| if (b >= 0x80) return true;
+    }
+    return false;
+}
+
+/// Per-window token refinement: the CJK fallback font rides ONLY the
+/// bubble window, whose hook text can be any language. Every other
+/// window (settings UI, pet chrome) is ASCII and keeps the fast bundled
+/// faces even while a CJK bubble is on screen — a whole-app fallback
+/// pushed the settings page through a 10MB CJK face per frame (the
+/// Settings scroll jank).
+fn petdexWindowTokens(window_label: []const u8, tokens: canvas.DesignTokens, model: *const Model) canvas.DesignTokens {
+    if (std.mem.eql(u8, window_label, "bubble") and custom_font_active and modelNeedsCjkFont(model)) {
+        var bubble_tokens = tokens;
+        bubble_tokens.typography.font_id = custom_font_id;
+        return bubble_tokens;
+    }
+    return tokens;
+}
+
 fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     const scheme: canvas.ColorScheme = if (model.dark) .dark else .light;
     var tokens = canvas.DesignTokens.theme(.{
@@ -334,7 +374,40 @@ fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     // The heading rung is reserved for bubble text so the manual size
     // preference remains available on the untouched Win/mac SDK too.
     tokens.typography.heading_size = model.bubble_text_px;
-    if (custom_font_active) tokens.typography.font_id = custom_font_id;
+    // A user-set font_path is an explicit whole-app choice. The CJK
+    // FALLBACK is not: it rides per-window instead (petdexWindowTokens
+    // scopes it to the bubble window), because a whole-app fallback
+    // pushes every settings label through a 10MB CJK face's shaping
+    // tables (the Settings scroll jank).
+    const user_font = initial_font_path_len > 0;
+    if (custom_font_active and user_font) tokens.typography.font_id = custom_font_id;
+    // Win32 wheel input is DISCRETE: one notch arrives as a whole
+    // 40-point delta, not the small continuous samples a trackpad
+    // streams. The stock physics reads that delta as a flick and scales
+    // it into a velocity (`wheel_velocity_scale` 60 => 2400 pt/s), whose
+    // decay integral carries ~15,900 points — an order of magnitude past
+    // the whole Settings page — while creeping there for ~40 s ("one
+    // notch jumps to the bottom, and slowly").
+    //
+    // The fix is a RESHAPED glide, not a disabled one: killing the
+    // velocity outright makes every notch a single-frame jump, which
+    // reads as teleporting. These numbers spend a notch as a small
+    // immediate step plus a short decaying glide — ~58 points total
+    // (about three lines) animated across ~15 frames / ~250 ms at
+    // 60 fps, so the motion eases out instead of stepping.
+    //
+    // They were found by sweeping the ENGINE's own ScrollState rather
+    // than a closed form, which matters more than it sounds:
+    // `deceleration_per_second` is the velocity fraction surviving one
+    // second, so across a 16 ms frame it barely bites, and what actually
+    // ends a glide is the `stop_velocity` floor — the analytic decay
+    // integral overestimated the travel by orders of magnitude.
+    if (builtin.target.os.tag == .windows) {
+        tokens.scroll.wheel_multiplier = 0.30;
+        tokens.scroll.wheel_velocity_scale = 25;
+        tokens.scroll.deceleration_per_second = 0.01;
+        tokens.scroll.stop_velocity = 100;
+    }
     // Linux's software presenter needs an alpha-zero clear all the way
     // into GTK's ARGB surface. Win32 and AppKit retain their upstream
     // platform-owned transparency paths and ordinary theme tokens.
@@ -1471,17 +1544,38 @@ fn decodeSheetForThumb(fx: *Effects, entry: *const CatalogEntry) ?Sheet {
     return decodeSheet(fx, entry);
 }
 
-/// Build one thumbnail into the atlas and re-register it. Incremental:
-/// the poll timer builds one per tick while settings is open, so the
-/// pet never freezes behind a 28-conversion batch.
-fn buildNextThumb(fx: *Effects) void {
-    if (thumbs_built >= catalog_mod.catalog_len) return;
-    const index = thumbs_built;
-    thumbs_built += 1;
+/// Build the next thumbnail the list can actually draw, then re-register
+/// the atlas. Lazy on purpose: a decode is the expensive part (a full
+/// platform-codec spritesheet conversion), and the collapsed list only
+/// shows `collapsed_pet_rows` rows plus the active pet's. Rows outside
+/// that set wait until the list expands or a filter reorders what is
+/// visible; expanding backfills one decode per tick, so the page never
+/// stalls behind a 90-conversion batch.
+fn buildNextThumb(fx: *Effects, model: *const Model) void {
     if (thumbs_pixels.len == 0) {
         thumbs_pixels = boot_allocator.alloc(u8, max_catalog * thumb_w * thumb_h * 4) catch return;
         @memset(thumbs_pixels, 0);
     }
+    const filter = model.pet_filter[0..model.pet_filter_len];
+    const max_visible: usize = if (model.pets_expanded) max_catalog else settings_view.collapsed_pet_rows;
+    var next: ?usize = null;
+    var visible: usize = 0;
+    // Scans the WHOLE catalog, not a `thumbs_built` prefix: the budget
+    // below is what bounds the work, and gating the scan on the
+    // already-decoded count made it an empty range that never picked
+    // anything (every row stayed blank).
+    for (0..@min(catalog_mod.catalog_len, max_catalog)) |i| {
+        if (!settings_view.petMatchesFilter(catalog[i].slice(), filter)) continue;
+        visible += 1;
+        // Same visibility rule the view applies: the first `max_visible`
+        // filter matches, plus the active pet wherever it sorts.
+        if (visible > max_visible and i != model.active_pet) continue;
+        if (thumbs_ready[i]) continue;
+        next = i;
+        break;
+    }
+    const index = next orelse return;
+    thumbs_built = @max(thumbs_built, index + 1);
     var decoded = decodeSheetForThumb(fx, &catalog[index]) orelse return;
     defer freeSheet(&decoded);
     const rows: usize = if (decoded.height * 1536 >= decoded.width * 2288) 11 else 9;
@@ -1623,6 +1717,23 @@ fn registerStateFrames(state: State, fx: *Effects) void {
 const poll_timer_key: u64 = 2;
 const poll_interval_ms: u32 = 100;
 const min_dwell_ms: u32 = 250;
+
+// ------------------------------------------------------------ save debounce
+// Sliders and text fields dispatch an event per change; persisting on
+// each one means a slider drag writes the settings file dozens of times
+// in a second, and each write is synchronous. Coalesce instead: mark
+// dirty, let the poll timer flush at most once per interval.
+const settings_save_key: u64 = 5;
+
+fn saveSettingsDebounced(model: *Model, fx: *Effects) void {
+    model.settings_dirty = true;
+    fx.startTimer(.{
+        .key = settings_save_key,
+        .interval_ms = poll_interval_ms * 2,
+        .mode = .one_shot,
+        .on_fire = Effects.timerMsg(.settings_save_tick),
+    });
+}
 
 /// Transient states whose duration is intrinsic to the animation;
 /// they revert to idle when their dwell expires and nothing is queued
@@ -1966,6 +2077,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .cycle_state => {
             applyState(model, model.state.next(), 0, fx);
         },
+        // Expanding widens the lazy thumbnail pass's row budget on the
+        // next poll tick; it does not decode anything here.
         .toggle_pets_expanded => model.pets_expanded = !model.pets_expanded,
         .dismiss_install_error => model.install.error_len = 0,
         .install_first_pet => {
@@ -2048,6 +2161,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .clear => model.pet_filter_len = 0,
                 else => {},
             }
+            // A new filter reorders the visible rows, so the lazy
+            // thumbnail pass has fresh work next tick.
+            thumbs_built = catalog_mod.catalog_len;
         },
         .uninstall_agent => |index| {
             if (index >= agent_hooks.agent_count) return;
@@ -2148,6 +2264,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.settings_open = true;
         },
         .settings_closed => model.settings_open = false,
+        .settings_save_tick => |timer| {
+            if (timer.outcome != .fired or !model.settings_dirty) return;
+            model.settings_dirty = false;
+            saveSettings(model);
+        },
         .update_boot_check => |timer| {
             if (timer.outcome == .fired and model.update_checks_enabled) startUpdateCheck(model, false, fx);
         },
@@ -2331,7 +2452,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.bubble_text_px = bubble_text_min_px + fraction * (bubble_text_max_px - bubble_text_min_px);
             _ = fitWindow(model, fx);
             syncBubbleWindow(model, fx);
-            saveSettings(model);
+            saveSettingsDebounced(model, fx);
         },
         .bubble_lifetime_input => |edit| {
             if (editUnsignedText(model.bubble_lifetime_text[0..], &model.bubble_lifetime_text_len, edit, 0, 60)) |value| {
@@ -2343,7 +2464,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     if (model.bubbles[i].busy) continue;
                     model.bubble_expires_at_ms[i] = bubbleDeadlineMs(now, model.bubble_lifetime_secs);
                 }
-                saveSettings(model);
+                saveSettingsDebounced(model, fx);
             }
         },
         .bubble_columns_input => |edit| {
@@ -2351,7 +2472,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.bubble_columns = value;
                 _ = fitWindow(model, fx);
                 syncBubbleWindow(model, fx);
-                saveSettings(model);
+                saveSettingsDebounced(model, fx);
             }
         },
         .bubble_answer_lines_input => |edit| {
@@ -2359,14 +2480,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.bubble_answer_lines = @intCast(value);
                 _ = fitWindow(model, fx);
                 syncBubbleWindow(model, fx);
-                saveSettings(model);
+                saveSettingsDebounced(model, fx);
             }
         },
         .font_path_input => |edit| {
             editPathText(model.font_path[0..], &model.font_path_len, edit);
             model.font_path_dirty = true;
             model.font_load_failed = false;
-            saveSettings(model);
+            saveSettingsDebounced(model, fx);
         },
         .toggle_hide_dock => {
             model.hide_dock = !model.hide_dock;
@@ -2395,7 +2516,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .set_scale => |fraction| {
             model.scale = 0.4 + fraction * 0.8;
             _ = fitWindow(model, fx);
-            saveSettings(model);
+            saveSettingsDebounced(model, fx);
         },
         .open_pet_page => |index| {
             if (index >= catalog_mod.catalog_len) return;
@@ -2642,7 +2763,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // `petdex://<slug>` link has work to do.
             drainPendingInstall(model, fx);
             if (!model.sheet_loaded) return;
-            if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
+            if (model.settings_open) buildNextThumb(fx, model);
             const now = fx.wallMs();
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
@@ -3626,6 +3747,20 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     const pet_w = frame_w * model.scale;
     const want_x = model.pet_x + pet_w / 2.0 - bubble_w / 2.0;
     const want_y = bubbleWantY(model, bubble_h);
+    // A want the display already refused stands down until the pet (or
+    // the flip/size that shaped it) moves: retrying it every frame is
+    // the oscillation, and the clamp keeps winning anyway.
+    if (model.bubble_clamped_want) |held| {
+        const want_held = @abs(want_x - held.x) <= window_position_epsilon and
+            @abs(want_y - held.y) <= window_position_epsilon;
+        const pet_held = @abs(model.pet_x - held.pet_x) <= window_position_epsilon and
+            @abs(model.pet_y - held.pet_y) <= window_position_epsilon;
+        if (want_held and pet_held) {
+            recordPetCenterLocal(model, cur.x);
+            return;
+        }
+        model.bubble_clamped_want = null;
+    }
     if (bubbleMovePlan(cur.x, cur.y, want_x, want_y)) |plan| {
         // `true` constrains against the display that currently owns the
         // window. It cannot be used for the first leg of a cross-display
@@ -3640,6 +3775,13 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
         // origin back and reconcile that legacy behavior explicitly; this
         // also makes the app robust while an SDK fix is rolling out.
         const actual = fx.moveWindow("bubble", 0, 0, false) orelse return;
+        // The display refused the want (reported settled origin differs
+        // from it): remember it so the next frame does not re-fight.
+        if (@abs(settled.x - want_x) > window_position_epsilon or
+            @abs(settled.y - want_y) > window_position_epsilon)
+        {
+            model.bubble_clamped_want = .{ .x = want_x, .y = want_y, .pet_x = model.pet_x, .pet_y = model.pet_y };
+        }
         if (bubbleClampCorrection(actual.x, actual.y, settled.x, settled.y)) |correction| {
             const corrected = fx.moveWindow("bubble", correction.dx, correction.dy, false) orelse return;
             recordPetCenterLocal(model, corrected.x);
@@ -4072,6 +4214,21 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
     return scratch.windows[0..count];
 }
 
+/// Msgs that cannot change the bubble or settings windows, so their
+/// dispatch skips those rebuilds. `frame_clock` is the one that matters:
+/// it fires once per PRESENTED FRAME to poll the drag, and rebuilding the
+/// settings page's ~90-node tree at frame rate kept a core saturated
+/// (which then starved the scrolling it was competing with). Everything
+/// the frame clock CAN change — the pet sprite, the bubble geometry — it
+/// applies through the main canvas and direct window moves, neither of
+/// which needs a secondary-window view rebuild.
+fn petdexSkipsWindowRebuild(msg: Msg) bool {
+    return switch (msg) {
+        .frame_clock => true,
+        else => false,
+    };
+}
+
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
@@ -4273,6 +4430,8 @@ pub fn main(init: std.process.Init) !void {
         .on_urls_opened = onUrlsOpened,
         .windows_fn = petdexWindows,
         .window_view = petdexWindowView,
+        .window_tokens_fn = petdexWindowTokens,
+        .window_rebuild_skip_fn = petdexSkipsWindowRebuild,
         .tokens_fn = petdexTokens,
         .fonts = app_fonts,
         .on_appearance = onAppearance,
@@ -4295,8 +4454,12 @@ pub fn main(init: std.process.Init) !void {
         // GTK presents application menus as an in-window menubar. On a
         // chromeless desktop pet that looks like a titlebar and also
         // steals vertical space; Linux already exposes these commands
-        // through the pet's context menu.
-        .menus = if (builtin.target.os.tag == .linux) &.{} else &app_menus,
+        // through the pet's context menu. Win32 does the same thing
+        // (SetMenu on the popup reserves a ~20px band above the client
+        // that reads as a phantom top border), so Windows rides the tray
+        // and context menu too. Only macOS gets a menu, where it lands
+        // in the system bar and costs the window nothing.
+        .menus = if (builtin.target.os.tag == .macos) &app_menus else &.{},
         .security = .{
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
@@ -5614,4 +5777,95 @@ test "CJK fallback only resolves paths the platform actually ships" {
     // nothing and reports null honestly.
     env_windir = "/nonexistent";
     try std.testing.expectEqual(@as(?[]const u8, null), platformCjkFontPath(&buf));
+}
+
+test "the lazy thumb budget follows the collapsed row count" {
+    // The view draws `collapsed_pet_rows` rows collapsed, the whole
+    // catalog expanded; the decoder has to agree or a collapsed list
+    // decodes the entire catalog (the Settings jank).
+    try std.testing.expectEqual(@as(usize, 6), settings_view.collapsed_pet_rows);
+    try std.testing.expect(settings_view.collapsed_pet_rows < max_catalog);
+}
+
+test "petMatchesFilter matches the view's filtering rule" {
+    // buildNextThumb reuses this scan to decide which rows can ever be
+    // drawn; if it drifted from the view's copy the wrong thumbnails
+    // would decode while the visible ones stayed blank.
+    try std.testing.expect(settings_view.petMatchesFilter("deepseek-cat", ""));
+    try std.testing.expect(settings_view.petMatchesFilter("deepseek-cat", "Seek"));
+    try std.testing.expect(!settings_view.petMatchesFilter("deepseek-cat", "codex"));
+    try std.testing.expect(!settings_view.petMatchesFilter("cat", "deepseek"));
+}
+
+test "Win32 wheel scrolling glides one notch and settles quickly" {
+    // Two bugs are pinned here, from opposite ends.
+    //
+    // 1. Stock physics: a single discrete Win32 notch (a whole 40-point
+    //    delta) became a 2400 pt/s flick whose decay integral ran
+    //    ~15,900 points over ~41 s, so one notch slid the whole Settings
+    //    page to the bottom, slowly.
+    // 2. Killing the velocity to stop that made every notch a
+    //    single-frame jump, which reads as teleporting.
+    //
+    // The contract is a SHORT GLIDE: a notch travels about three lines
+    // over a fraction of a second, animated across enough frames to
+    // ease rather than step.
+    const model = Model{};
+    const tokens = petdexTokens(&model);
+    if (builtin.target.os.tag != .windows) return;
+
+    const win32_notch_delta: f32 = 40;
+    const start = canvas.ScrollState{ .offset = 0, .viewport_extent = 680, .content_extent = 1400 };
+    const scrolled = start.applyWheelClamped(win32_notch_delta, tokens.scroll);
+
+    // The immediate step is a fraction of a notch, and the glide that
+    // follows is real (there is kinetic work left to do).
+    try std.testing.expect(scrolled.offset > 0);
+    try std.testing.expect(scrolled.offset < 20);
+    try std.testing.expect(scrolled.needsKineticStep(tokens.scroll));
+
+    // Step the glide at 60 fps and hold it to the design envelope: it
+    // settles well under a second, having moved about three lines, and
+    // takes enough frames to look animated instead of instant.
+    var state = scrolled;
+    var frames: usize = 0;
+    while (state.needsKineticStep(tokens.scroll) and frames < 240) : (frames += 1) {
+        state = state.stepKinetic(1000.0 / 60.0, tokens.scroll);
+    }
+    try std.testing.expect(frames >= 6); // animated, not a teleport
+    try std.testing.expect(frames <= 45); // settles promptly (<=0.75s)
+    try std.testing.expect(state.offset > 40);
+    try std.testing.expect(state.offset < 90);
+
+    // And it still takes many notches to cross the page, not one.
+    try std.testing.expect(state.offset < state.maxOffset() / 4);
+}
+
+test "the CJK fallback font rides only on non-ASCII showable bubbles" {
+    // The fallback font is a 10MB face; routing every settings label
+    // through it was the Settings scroll jank, so petdexWindowTokens
+    // scopes it to the bubble window and only while a bubble that can
+    // actually show carries non-ASCII text.
+    var model = Model{};
+    try std.testing.expect(!modelNeedsCjkFont(&model));
+
+    testPushBubble(&model, "s1", "all ascii", false, 4000);
+    try std.testing.expect(!modelNeedsCjkFont(&model));
+
+    testPushBubble(&model, "s2", "\u{4f60}\u{597d}", false, 4000);
+    try std.testing.expect(modelNeedsCjkFont(&model));
+
+    // Focus mode hides the bubble: nothing on screen needs the face.
+    model.focus_mode = true;
+    try std.testing.expect(!modelNeedsCjkFont(&model));
+
+    // The window scoping itself: the bubble window adopts the custom
+    // face, the settings window never does.
+    const saved_font = custom_font_active;
+    defer custom_font_active = saved_font;
+    custom_font_active = true;
+    model.focus_mode = false;
+    const base = petdexTokens(&model);
+    try std.testing.expectEqual(base.typography.font_id, petdexWindowTokens("settings", base, &model).typography.font_id);
+    try std.testing.expectEqual(custom_font_id, petdexWindowTokens("bubble", base, &model).typography.font_id);
 }
