@@ -136,9 +136,10 @@ pub const Msg = union(enum) {
     download_update,
     copy_brew_command,
     brew_command_copied: native_sdk.EffectClipboardResult,
+    bubble_frame_tick: native_sdk.EffectTimer,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "settings_save_tick" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "settings_save_tick", "bubble_frame_tick" };
 };
 
 pub const Model = struct {
@@ -848,6 +849,7 @@ const update_boot_timer_key: u64 = 33;
 const homebrew_timeout_timer_key: u64 = 34;
 const dsh_install_key: u64 = 35;
 const dsh_remove_key: u64 = 36;
+const bubble_frame_timer_key: u64 = 37;
 const update_boot_delay_ms: u32 = 5000;
 const update_background_interval_ms: i64 = 24 * 60 * 60 * 1000;
 const update_settings_interval_ms: i64 = 5 * 60 * 1000;
@@ -2416,6 +2418,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (model.waiting_sound) playWaitingChime(fx);
         },
         .chime_done => {},
+        // Delayed one-shot from the bubble update path: the bubble
+        // window needs a presented frame to paint the content the
+        // dispatch just built, and the request is delayed past the
+        // window create (see the poll_tick comment) so it is not a
+        // silent no-op. A no-op anyway when the window is gone.
+        .bubble_frame_tick => |timer| {
+            if (timer.outcome != .fired) return;
+            if (!bubbleActive(model)) return;
+            fx.requestFrame("bubble");
+        },
         .remote_line => |line| {
             const decoded = remote_runtime.slotOpFromKey(line.key) orelse return;
             if (decoded.slot >= model.remote_count) return;
@@ -2665,6 +2677,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // needs no cursor.
             updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
+            // The hover fan animation drives its own expansion on this
+            // frame clock, but the bubble window only repaints when a
+            // frame is requested for it. While the expansion is between
+            // its current and target values the stack is visibly moving,
+            // so keep presenting: a request per animated frame is the
+            // cost of the animation, and it stops the moment the fan
+            // settles (no idle spin for a parked stack).
+            if (bubbleActive(model) and model.bubble_expansion != model.bubble_expansion_target) {
+                fx.requestFrame("bubble");
+            }
             if (model.dragging) {
                 // A drag must not wait for the idle animation's cadence:
                 // follow the cursor at frame rate while the button is down.
@@ -2823,8 +2845,31 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // wait for the settings window to get its avatar.
                     if (model.bubbles_len > 1) loadAgentsAtlas(model.dark, fx);
                 }
+                // The bubble window's content changed (or just came into
+                // existence) and the dispatch that follows this update will
+                // build it. The idle-frame fix stopped the host from
+                // re-presenting a window on its own, and the bubble is
+                // click-through so no input ever requests a frame for it:
+                // a freshly created window never gets the install frame that
+                // builds its canvas, so it stays transparent. Request a frame
+                // on a delayed tick so the window create applyWindows runs
+                // during this dispatch has landed first (a request before the
+                // view exists is a silent no-op on the host).
+                if (bubbleActive(model)) {
+                    fx.startTimer(.{
+                        .key = bubble_frame_timer_key,
+                        .interval_ms = 1,
+                        .mode = .one_shot,
+                        .on_fire = Effects.timerMsg(.bubble_frame_tick),
+                    });
+                }
             }
-            _ = expireBubbles(model, now);
+            const bubbles_expired = expireBubbles(model, now);
+            // An expiry that emptied the stack tears the window down via
+            // applyWindows; one that just shrank it needs a repaint too.
+            if (bubbles_expired and bubbleActive(model)) {
+                fx.requestFrame("bubble");
+            }
             if (model.waiting_sound and shouldEscalate(model.state, model.waiting_since_ms, model.waiting_escalated, now)) {
                 model.waiting_escalated = true;
                 playWaitingChime(fx);
@@ -3756,6 +3801,11 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
         _ = fx.resizeWindow("bubble", bubble_w, bubble_h, .top_left);
         bubble_window_w = bubble_w;
         bubble_window_h = bubble_h;
+        // A resize tears the DWM surface down; the canvas holds the
+        // freshly built content but nothing presents it (idle frame
+        // fix + click-through). Request one so the resized window
+        // repaints instead of sitting transparent.
+        fx.requestFrame("bubble");
     }
     const cur = fx.moveWindow("bubble", 0, 0, false) orelse return;
     const pet_w = frame_w * model.scale;

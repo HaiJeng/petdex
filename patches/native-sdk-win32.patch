@@ -55,7 +55,7 @@ index 7debdf9..6b5ea0d 100644
      const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
      if (native_sdk_windows_start_window_drag(self.host, window_id) == 0) return error.WindowNotFound;
 diff --git a/src/platform/windows/webview2_host.cpp b/src/platform/windows/webview2_host.cpp
-index 4dd7ecd..a9261ec 100644
+index 4dd7ecd..e0a954c 100644
 --- a/src/platform/windows/webview2_host.cpp
 +++ b/src/platform/windows/webview2_host.cpp
 @@ -412,6 +412,18 @@ struct NativeView {
@@ -156,7 +156,25 @@ index 4dd7ecd..a9261ec 100644
                  for (auto &entry : host->windows) emit(host, entry.second, kFrame);
              }
              return 0;
-@@ -6101,6 +6155,98 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
+@@ -5334,6 +5388,17 @@ static void applyCompanionWindowChrome(Window &window) {
+          * on every show is the opposite of the always-visible accessory
+          * shape this flag exists for. */
+         SetWindowPos(window.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++        /* Floating companion windows (a desktop pet, a speech bubble, a
++         * notification) have no business in the taskbar or the Alt-Tab
++         * list: the desktop they float over IS their place. Without
++         * WS_EX_TOOLWINDOW, Windows shows each one as a taskbar button
++         * named after the app, which reads as "why are there three of
++         * this app". The window itself is untouched — still visible,
++         * still topmost, still click-through. */
++        LONG_PTR floating_ex = GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE);
++        if (!(floating_ex & WS_EX_TOOLWINDOW)) {
++            SetWindowLongPtrW(window.hwnd, GWL_EXSTYLE, floating_ex | WS_EX_TOOLWINDOW);
++        }
+     }
+ 
+     /* WS_EX_TRANSPARENT without WS_EX_LAYERED does not produce
+@@ -6101,6 +6166,98 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
      return 1;
  }
  
@@ -255,7 +273,7 @@ index 4dd7ecd..a9261ec 100644
  int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
      if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
      auto window = host->windows.find(window_id);
-@@ -6332,8 +6478,18 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
+@@ -6332,8 +6489,18 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
       * presents keep the heartbeat — they ARE the spin being throttled. */
      const bool first_present = !view.gpu_presented;
      view.gpu_presented = true;
@@ -349,7 +367,7 @@ index 284f05d..67225ee 100644
          /// the anchor fixed (`.top_left` or `.bottom_center`). False
          /// under the fake executor, when no window actions are bound,
 diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
-index bedf1c3..b127285 100644
+index bedf1c3..8acb763 100644
 --- a/src/runtime/ui_app.zig
 +++ b/src/runtime/ui_app.zig
 @@ -687,6 +687,28 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
@@ -413,7 +431,7 @@ index bedf1c3..b127285 100644
              tokens.pixel_snap.scale = slot.pixel_snap_scale;
              return tokens;
          }
-@@ -3689,6 +3720,18 @@ fn effectsFocusWindowByLabel(context: *anyopaque, window_label: []const u8) bool
+@@ -3689,6 +3720,29 @@ fn effectsFocusWindowByLabel(context: *anyopaque, window_label: []const u8) bool
      return true;
  }
  
@@ -425,8 +443,19 @@ index bedf1c3..b127285 100644
 +fn effectsRequestFrameByLabel(context: *anyopaque, window_label: []const u8) bool {
 +    const runtime: *Runtime = @ptrCast(@alignCast(context));
 +    const window_id = effectsWindowIdByLabel(runtime, window_label) orelse return false;
-+    runtime.options.platform.services.requestGpuSurfaceFrame(window_id, window_label) catch return false;
-+    return true;
++    // The platform frame service keys views by their VIEW label (the
++    // canvas label), not the window label: a secondary window named
++    // "bubble" hosts a "bubble-canvas" gpu_surface view. Passing the
++    // window label through would miss the view and silently no-op, which
++    // is exactly what left the bubble window never repainting under the
++    // idle-frame fix. Find the window's gpu_surface view label instead.
++    for (runtime.views[0..runtime.view_count]) |view| {
++        if (view.kind != .gpu_surface) continue;
++        if (view.window_id != window_id) continue;
++        runtime.options.platform.services.requestGpuSurfaceFrame(window_id, view.label) catch return false;
++        return true;
++    }
++    return false;
 +}
 +
  fn effectsMinimizeWindowByLabel(context: *anyopaque, window_label: []const u8) bool {
