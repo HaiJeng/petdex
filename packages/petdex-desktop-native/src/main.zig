@@ -2606,6 +2606,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             const now = fx.wallMs();
             if (model.throwing) {
+                // Keep the frame loop alive while physics runs: a thrown
+                // pet moves on its own and must not wait for the idle
+                // animation's slower cadence to emit frames.
+                fx.requestFrame("main");
                 // Momentum rides the frame clock with the real elapsed
                 // time: no timer jitter, friction scaled per frame.
                 var dt_ms = now - model.last_physics_ms;
@@ -2662,6 +2666,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
             if (model.dragging) {
+                // A drag must not wait for the idle animation's cadence:
+                // follow the cursor at frame rate while the button is down.
+                fx.requestFrame("main");
                 if (read.primary_down) {
                     // Follow the cursor keeping the grab offset, and
                     // record OUR OWN applied positions: the app drives
@@ -2755,6 +2762,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 pushSample(model, read.x, read.y, now);
             }
             model.primary_was_down = read.primary_down;
+            // The drag-detection branch above sets `dragging` AFTER the
+            // `if (model.dragging)` continuation block, so the frame that
+            // STARTS a drag cannot reach that block's `requestFrame`. Keep
+            // the loop alive from here: once the pet is being dragged (or
+            // thrown) the frame clock must keep running even if this frame
+            // had no visual diff to arm one.
+            if (model.dragging or model.throwing) fx.requestFrame("main");
         },
         .poll_tick => |timer| {
             if (timer.outcome != .fired) return;

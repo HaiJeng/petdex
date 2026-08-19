@@ -36,4 +36,4 @@ apply_idempotent() {
 }
 
 apply_idempotent "macOS Mach-O headerpad fix" "$ROOT/patches/native-sdk-macos-headerpad.patch"
-apply_idempotent "Windows move/resize window services" "$ROOT/patches/native-sdk-win32-move-resize.patch"
+apply_idempotent "Windows desktop native fixes (move/resize + idle frame loop)" "$ROOT/patches/native-sdk-win32.patch"

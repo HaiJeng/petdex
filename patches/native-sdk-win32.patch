@@ -55,7 +55,7 @@ index 7debdf9..6b5ea0d 100644
      const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
      if (native_sdk_windows_start_window_drag(self.host, window_id) == 0) return error.WindowNotFound;
 diff --git a/src/platform/windows/webview2_host.cpp b/src/platform/windows/webview2_host.cpp
-index 4dd7ecd..e1d21b6 100644
+index 4dd7ecd..a9261ec 100644
 --- a/src/platform/windows/webview2_host.cpp
 +++ b/src/platform/windows/webview2_host.cpp
 @@ -412,6 +412,18 @@ struct NativeView {
@@ -255,8 +255,101 @@ index 4dd7ecd..e1d21b6 100644
  int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
      if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
      auto window = host->windows.find(window_id);
+@@ -6332,8 +6478,18 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
+      * presents keep the heartbeat — they ARE the spin being throttled. */
+     const bool first_present = !view.gpu_presented;
+     view.gpu_presented = true;
+-    if (first_present) view.gpu_prompt_frame_pending = true;
+-    gpuSurfaceScheduleFrameEmission(view);
++    /* A present is a COMPLETION, not a producer: an idle surface that
++     * painted its frame must not arm another emission by itself, or the
++     * host spins forever at frame rate even when the runtime had nothing
++     * new to draw. The next frame now comes only from an explicit
++     * producer — a runtime frame request (a diff'd rebuild, an armed
++     * animation, or an app's `requestFrame`) or an input's responding
++     * frame. The first present is exempt: it retires the placeholder
++     * pump and the install choreography rides the first frame events. */
++    if (first_present) {
++        view.gpu_prompt_frame_pending = true;
++        gpuSurfaceScheduleFrameEmission(view);
++    }
+     return 1;
+ }
+ 
+diff --git a/src/runtime/canvas_widget_state.zig b/src/runtime/canvas_widget_state.zig
+index 61fcfeb..11ed306 100644
+--- a/src/runtime/canvas_widget_state.zig
++++ b/src/runtime/canvas_widget_state.zig
+@@ -146,7 +146,6 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
+             // retained nodes.
+             const disclosure_plan = planCanvasWidgetDisclosureTween(self, index, previous_layout, reconciled_layout);
+             const previous_cursor = self.views[index].canvas_widget_cursor;
+-            const previous_widget_revision = self.views[index].widget_revision;
+             try self.views[index].copyWidgetLayoutTree(reconciled_layout, &self.canvas_widget_copy_scratch);
+             try self.views[index].copyCanvasWidgetSourceText(layout);
+             self.views[index].copyCanvasWidgetSourceScroll(layout);
+@@ -158,7 +157,6 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
+             // (Windows WM_NCHITTEST); no-op wherever the service is
+             // absent, and pushes only on actual change.
+             try CanvasWidgetEventMethods(Runtime).syncCanvasWidgetWindowDragRegionsForView(self, index);
+-            const widget_revision_changed = self.views[index].widget_revision != previous_widget_revision;
+             if (previous_cursor != self.views[index].canvas_widget_cursor) try CanvasWidgetEventMethods(Runtime).syncCanvasWidgetCursorForView(self, index);
+             CanvasWidgetEventMethods(Runtime).invalidateForWidgetInvalidations(self, self.views[index].frame, invalidations);
+             if (render_state_changed) CanvasWidgetEventMethods(Runtime).invalidateForCanvasWidgetRenderStateDirty(self, index, render_state_dirty);
+@@ -197,7 +195,16 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
+             // point-blind scroll paths do.
+             try CanvasWidgetEventMethods(Runtime).reconcileCanvasWidgetInteractionAfterLayoutAdoption(self, index, adoption_tooltip_bindings);
+             const requested_frame = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayListIfOwned(self, index);
+-            if ((layout_dirty or widget_revision_changed) and !requested_frame) try CanvasFrameMethods(Runtime).requestCanvasFrameForView(self, index);
++            // A rebuild that changed neither the widget layout nor the
++            // display list has nothing new to paint, so it must not arm
++            // another frame: `widget_revision_changed` alone is not a
++            // repaint signal — the copy path bumps it on every rebuild of
++            // a same-buffer tree, which would otherwise keep an idle app
++            // at frame rate forever. Actual visual changes always reach
++            // here as `layout_dirty` (a widget diff) or `requested_frame`
++            // (a display-list diff), so dropping the revision term from
++            // the gate loses nothing but the idle spin.
++            if (layout_dirty and !requested_frame) try CanvasFrameMethods(Runtime).requestCanvasFrameForView(self, index);
+             return self.views[index].info();
+         }
+ 
+diff --git a/src/runtime/effects.zig b/src/runtime/effects.zig
+index 284f05d..67225ee 100644
+--- a/src/runtime/effects.zig
++++ b/src/runtime/effects.zig
+@@ -219,6 +219,12 @@ pub const WindowActionBinding = struct {
+     move_fn: *const fn (context: *anyopaque, window_label: []const u8, dx: f64, dy: f64, clamp: bool) ?MoveWindowResult,
+     resize_fn: *const fn (context: *anyopaque, window_label: []const u8, width: f64, height: f64, anchor: WindowResizeAnchor) bool,
+     focus_fn: *const fn (context: *anyopaque, window_label: []const u8) bool,
++    /// Ask the runtime to schedule one more presented frame for the
++    /// window's main canvas. An app that drives its own motion (drag
++    /// physics, a throwing pet) calls this each frame it wants to keep
++    /// running; without it the surface parks after its last real change.
++    /// No-op on hosts with no gpu-surface view for the label.
++    request_frame_fn: ?*const fn (context: *anyopaque, window_label: []const u8) bool = null,
+ };
+ 
+ pub const MoveWindowResult = platform.MoveWindowResult;
+@@ -3345,6 +3351,16 @@ pub fn Effects(comptime Msg: type) type {
+             return binding.move_fn(binding.context, window_label, dx, dy, clamp);
+         }
+ 
++        /// Schedule one more presented frame for the window's main canvas.
++        /// Apps that drive their own per-frame motion (drag physics, a
++        /// thrown pet) call this every frame they need to keep running.
++        pub fn requestFrame(self: *Self, window_label: []const u8) void {
++            if (self.executor == .fake) return;
++            const binding = self.window_actions orelse return;
++            const request_frame_fn = binding.request_frame_fn orelse return;
++            _ = request_frame_fn(binding.context, window_label);
++        }
++
+         /// Resize a window to an exact size in screen points, keeping
+         /// the anchor fixed (`.top_left` or `.bottom_center`). False
+         /// under the fake executor, when no window actions are bound,
 diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
-index bedf1c3..5b53c60 100644
+index bedf1c3..b127285 100644
 --- a/src/runtime/ui_app.zig
 +++ b/src/runtime/ui_app.zig
 @@ -687,6 +687,28 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
@@ -288,7 +381,15 @@ index bedf1c3..5b53c60 100644
          };
  
          /// Last-navigated webview pane state, tracked per shell label so
-@@ -1166,7 +1188,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1100,6 +1122,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+                 .resize_fn = effectsResizeWindowByLabel,
+                 .focus_fn = effectsFocusWindowByLabel,
+                 .minimize_fn = effectsMinimizeWindowByLabel,
++                .request_frame_fn = effectsRequestFrameByLabel,
+             });
+             if (runtime.options.session_recorder) |recorder| {
+                 self.effects.bindJournal(recorder.effectJournal());
+@@ -1166,7 +1189,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              // used to cost a full view build on the launch path.
              if (!self.installed) return;
              try self.rebuild(runtime, self.canvas_window_id);
@@ -302,7 +403,7 @@ index bedf1c3..5b53c60 100644
              // A Msg dispatched FROM a secondary window still rebuilt the
              // main canvas above (one model, every window's view derives
              // from it); `window_id` names the dispatch origin for apps
-@@ -1277,6 +1304,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1277,6 +1305,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
          /// the appearance.
          fn slotEffectiveTokens(self: *const Self, slot: *const WindowSlot) canvas.DesignTokens {
              var tokens = self.effectiveTokens();
@@ -312,3 +413,22 @@ index bedf1c3..5b53c60 100644
              tokens.pixel_snap.scale = slot.pixel_snap_scale;
              return tokens;
          }
+@@ -3689,6 +3720,18 @@ fn effectsFocusWindowByLabel(context: *anyopaque, window_label: []const u8) bool
+     return true;
+ }
+ 
++/// Schedule one more presented frame for the window's main canvas, so an
++/// app driving its own per-frame motion can keep its frame loop alive
++/// without a spurious rebuild. Resolves the label to a window id exactly
++/// like the other window actions; a label with no gpu-surface view is a
++/// silent no-op.
++fn effectsRequestFrameByLabel(context: *anyopaque, window_label: []const u8) bool {
++    const runtime: *Runtime = @ptrCast(@alignCast(context));
++    const window_id = effectsWindowIdByLabel(runtime, window_label) orelse return false;
++    runtime.options.platform.services.requestGpuSurfaceFrame(window_id, window_label) catch return false;
++    return true;
++}
++
+ fn effectsMinimizeWindowByLabel(context: *anyopaque, window_label: []const u8) bool {
+     const runtime: *Runtime = @ptrCast(@alignCast(context));
+     const window_id = effectsWindowIdByLabel(runtime, window_label) orelse return false;
