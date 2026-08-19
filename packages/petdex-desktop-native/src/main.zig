@@ -4610,8 +4610,8 @@ test "cached update versions restore the correct phase" {
     model.latest_version_len = "0.9.0".len;
     updateCachePhase(&model);
     try std.testing.expectEqual(updates.Phase.available, model.update_phase);
-    @memcpy(model.latest_version[0.."0.8.0".len], "0.8.0");
-    model.latest_version_len = "0.8.0".len;
+    @memcpy(model.latest_version[0.."0.8.1".len], "0.8.1");
+    model.latest_version_len = "0.8.1".len;
     updateCachePhase(&model);
     try std.testing.expectEqual(updates.Phase.current, model.update_phase);
 }
